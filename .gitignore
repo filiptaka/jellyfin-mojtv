@@ -1,0 +1,7 @@
+# Upstream checkouts used for development (see README)
+/jellyfin/
+/jellyfin-web/
+# Build output
+/out/
+# Local notes and screenshots for the upstream PR
+/pr/

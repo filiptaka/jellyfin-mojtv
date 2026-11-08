@@ -1,0 +1,89 @@
+From dde31010cbc03a199ff3ebac5d4b3b805b743288 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Fillip=20Stoji=C4=87?= <filip.taka@gmail.com>
+Date: Sun, 8 Nov 2026 20:19:05 +0100
+Subject: [PATCH] Add Recently Added options to the display settings
+
+Adds checkboxes for the server options from jellyfin/jellyfin#18381 that
+control what the Recently Added rows of TV libraries show: seasons and
+single episodes. With both off, every show appears once as the whole show.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../dashboard/routes/libraries/display.tsx    | 37 ++++++++++++++++++-
+ 1 file changed, 36 insertions(+), 1 deletion(-)
+
+diff --git a/src/apps/dashboard/routes/libraries/display.tsx b/src/apps/dashboard/routes/libraries/display.tsx
+index 26a977b..5e56b72 100644
+--- a/src/apps/dashboard/routes/libraries/display.tsx
++++ b/src/apps/dashboard/routes/libraries/display.tsx
+@@ -21,9 +21,16 @@ import { type ActionFunctionArgs, Form, useActionData, useNavigation } from 'rea
+ import { ActionData } from 'types/actionData';
+ import { queryClient } from 'utils/query/queryClient';
+ import type { MetadataConfiguration } from '@jellyfin/sdk/lib/generated-client/models/metadata-configuration';
++import type { ServerConfiguration } from '@jellyfin/sdk/lib/generated-client/models/server-configuration';
+ 
+ const CONFIG_KEY = 'metadata';
+ 
++// TODO: Remove once the SDK includes the recently added options (jellyfin/jellyfin#18381)
++type DisplayConfiguration = ServerConfiguration & {
++    DisplayLatestSeasons?: boolean;
++    DisplayLatestEpisodes?: boolean;
++};
++
+ export const action = async ({ request }: ActionFunctionArgs) => {
+     const api = ServerConnections.getApi();
+     if (!api) throw new Error('No Api instance available');
+@@ -31,7 +38,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
+     const formData = await request.formData();
+     const data = Object.fromEntries(formData);
+ 
+-    const { data: config } = await getSystemApi(api).getConfiguration();
++    const config: DisplayConfiguration = (await getSystemApi(api).getConfiguration()).data;
+ 
+     const metadataConfig: MetadataConfiguration = {
+         UseFileCreationTimeForDateAdded: data.DateAddedBehavior.toString() === '1'
+@@ -41,6 +48,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
+     config.DisplaySpecialsWithinSeasons = data.DisplaySpecialsWithinSeasons?.toString() === 'on';
+     config.EnableGroupingMoviesIntoCollections = data.GroupMoviesIntoCollections?.toString() === 'on';
+     config.EnableGroupingShowsIntoCollections = data.GroupShowsIntoCollections?.toString() === 'on';
++    config.DisplayLatestSeasons = data.DisplayLatestSeasons?.toString() === 'on';
++    config.DisplayLatestEpisodes = data.DisplayLatestEpisodes?.toString() === 'on';
+     config.EnableExternalContentInSuggestions = data.EnableExternalContentInSuggestions?.toString() === 'on';
+ 
+     await getSystemApi(api)
+@@ -161,6 +170,32 @@ export const Component = () => {
+                                 <FormHelperText>{globalize.translate('LabelGroupShowsIntoCollectionsHelp')}</FormHelperText>
+                             </FormControl>
+ 
++                            <FormControl>
++                                <FormControlLabel
++                                    control={
++                                        <Checkbox
++                                            name={'DisplayLatestSeasons'}
++                                            defaultChecked={(config as DisplayConfiguration).DisplayLatestSeasons}
++                                        />
++                                    }
++                                    label={globalize.translate('LabelDisplayLatestSeasons')}
++                                />
++                                <FormHelperText>{globalize.translate('LabelDisplayLatestSeasonsHelp')}</FormHelperText>
++                            </FormControl>
++
++                            <FormControl>
++                                <FormControlLabel
++                                    control={
++                                        <Checkbox
++                                            name={'DisplayLatestEpisodes'}
++                                            defaultChecked={(config as DisplayConfiguration).DisplayLatestEpisodes}
++                                        />
++                                    }
++                                    label={globalize.translate('LabelDisplayLatestEpisodes')}
++                                />
++                                <FormHelperText>{globalize.translate('LabelDisplayLatestEpisodesHelp')}</FormHelperText>
++                            </FormControl>
++
+                             <FormControl>
+                                 <FormControlLabel
+                                     control={
+-- 
+2.38.1.windows.1
+

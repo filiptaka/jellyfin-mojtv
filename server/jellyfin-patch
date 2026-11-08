@@ -1,0 +1,210 @@
+#!/bin/bash
+# jellyfin-patch: run the apt-installed Jellyfin with the moj.tv patch, without
+# changing any file that belongs to the jellyfin-server or jellyfin-web packages.
+#
+# Before every start (ExecStartPre), `prepare` builds /var/lib/jellyfin-patch/run:
+#   run/bin  hard links to /usr/lib/jellyfin/bin, with the patched assemblies swapped in
+#   run/web  the patched web client (or the packaged one)
+# and `run` (ExecStart) starts run/bin/jellyfin with --webdir=run/web.
+#
+# A patched build is used only for the exact version installed by apt. When there
+# is none (not built yet, download failed, patch disabled), Jellyfin starts stock.
+# Builds come from the GitHub releases of $REPO: v<version>/jellyfin-patch-<version>.tar.gz
+#
+#   jellyfin-patch status            what is installed, cached and running
+#   jellyfin-patch fetch [VERSION]   download and check the build (default: installed version)
+#   jellyfin-patch add FILE.tar.gz   add a build from a local file (with FILE.tar.gz.sha256 next to it)
+#   jellyfin-patch disable | enable  stop or resume using the patch (takes effect at the next restart)
+#   jellyfin-patch prepare           (ExecStartPre, as root)
+#   jellyfin-patch run ARGS...       (ExecStart, as the jellyfin user)
+set -uo pipefail
+
+REPO=filiptaka/jellyfin-mojtv
+[ -r /etc/jellyfin-patch.conf ] && . /etc/jellyfin-patch.conf
+
+# The paths can be overridden for testing.
+STATE=${JELLYFIN_PATCH_STATE:-/var/lib/jellyfin-patch}
+STOCK_BIN=${JELLYFIN_PATCH_STOCK_BIN:-/usr/lib/jellyfin/bin}
+STOCK_WEB=${JELLYFIN_PATCH_STOCK_WEB:-/usr/share/jellyfin/web}
+STOCK_EXE=${JELLYFIN_PATCH_STOCK_EXE:-/usr/bin/jellyfin}
+LOG=${JELLYFIN_PATCH_LOG:-/var/log/jellyfin-patch.log}
+BUILDS=$STATE/builds
+RUN=$STATE/run
+DISABLED=$STATE/disabled
+KEEP_BUILDS=3
+
+log() {
+    echo "jellyfin-patch: $*"
+    [ -w "$(dirname "$LOG")" ] && echo "$(date '+%F %T') $*" >> "$LOG"
+    return 0
+}
+
+# Upstream version of an installed package: 12.4+ubu2404 -> 12.4
+installed() { dpkg-query -W -f='${Version}' "$1" 2>/dev/null | cut -d+ -f1; }
+
+valid_version() { [[ $1 =~ ^[0-9]{1,3}(\.[0-9]{1,4}){1,3}$ ]]; }
+
+manifest_get() { python3 -I -c 'import json,sys; m=json.load(open(sys.argv[1])); v=m.get(sys.argv[2]); print("\n".join(v) if isinstance(v, list) else ("" if v is None else str(v).lower()))' "$1" "$2" | tr -d '\r'; }
+
+# Unpack a downloaded tarball (with its .sha256) into $BUILDS/<version>.
+add_build() {
+    local tarball=$1 version=$2 expected tmp
+    expected=$(cut -d' ' -f1 < "$tarball.sha256") || return 1
+    if [ "$(sha256sum "$tarball" | cut -d' ' -f1)" != "$expected" ]; then
+        log "checksum mismatch for $tarball"
+        return 1
+    fi
+    tmp=$(mktemp -d "$BUILDS/.new-XXXXXX") || return 1
+    if ! tar -xzf "$tarball" -C "$tmp" --no-same-owner --no-same-permissions; then
+        rm -rf "$tmp"; return 1
+    fi
+    if [ "$(manifest_get "$tmp/manifest.json" version)" != "$version" ]; then
+        log "$tarball is not a build of $version"
+        rm -rf "$tmp"; return 1
+    fi
+    chmod -R u=rwX,go=rX "$tmp"
+    echo "$expected" > "$tmp/.sha256"
+    rm -rf "$BUILDS/$version.old"
+    [ -d "$BUILDS/$version" ] && mv "$BUILDS/$version" "$BUILDS/$version.old"
+    mv "$tmp" "$BUILDS/$version" && rm -rf "$BUILDS/$version.old"
+    log "build $version ready ($(manifest_get "$BUILDS/$version/manifest.json" source))"
+    # Keep the newest few builds, and always the installed version's (a running server may use its web client).
+    local current
+    current=$(installed jellyfin-server)
+    ls -1 "$BUILDS" | grep -E '^[0-9.]+$' | sort -V | head -n -$KEEP_BUILDS | while read -r old; do
+        [ "$old" = "$current" ] || rm -rf "${BUILDS:?}/$old"
+    done
+}
+
+fetch() {
+    local version=$1 tmp url status=0
+    valid_version "$version" || { log "invalid version '$version'"; return 1; }
+    mkdir -p "$BUILDS"
+    tmp=$(mktemp -d) || return 1
+    url=$(url_for "$version")
+    if curl -fsSL --max-time 120 -o "$tmp/build.tar.gz" "$url" && curl -fsSL --max-time 30 -o "$tmp/build.tar.gz.sha256" "$url.sha256"; then
+        add_build "$tmp/build.tar.gz" "$version" || status=1
+    else
+        log "no patched build for $version at $url"
+        status=1
+    fi
+    rm -rf "$tmp"
+    return $status
+}
+
+url_for() { echo "https://github.com/$REPO/releases/download/v$1/jellyfin-patch-$1.tar.gz"; }
+
+# Download the build for a version when the published one differs from the cached one.
+# Only the small checksum file is fetched when nothing changed. Succeeds when a build is cached.
+refresh() {
+    local version=$1 published
+    published=$(curl -fsSL --max-time 10 "$(url_for "$version").sha256" 2>/dev/null | cut -d' ' -f1)
+    if [ -n "$published" ] && [ "$published" != "$(cat "$BUILDS/$version/.sha256" 2>/dev/null)" ]; then
+        fetch "$version"
+    fi
+    [ -f "$BUILDS/$version/manifest.json" ]
+}
+
+prepare() {
+    local version web_version build new file
+    version=$(installed jellyfin-server)
+    web_version=$(installed jellyfin-web)
+    build=$BUILDS/$version
+
+    # Replacing the files under a running Jellyfin could hand it assemblies of another version.
+    if [ "$(systemctl show -p ActiveState --value jellyfin 2>/dev/null)" = active ]; then
+        log "Jellyfin is running; the patch is prepared when it starts"
+        return 0
+    fi
+    rm -rf "$STATE/run.new" "$STATE/run.old"
+
+    if [ -e "$DISABLED" ] || ! valid_version "$version"; then
+        log "patch disabled or jellyfin-server not installed; starting stock Jellyfin"
+        rm -rf "$RUN"; return 0
+    fi
+
+    refresh "$version" || {
+        log "starting stock Jellyfin $version"
+        rm -rf "$RUN"; return 0
+    }
+
+    new=$STATE/run.new
+    mkdir -p "$new"
+    # Hard links cost nothing; copy only when they are impossible (another file system).
+    if ! cp -al "$STOCK_BIN" "$new/bin" 2>/dev/null; then
+        rm -rf "$new/bin"
+        cp -a "$STOCK_BIN" "$new/bin" || { log "could not copy $STOCK_BIN; starting stock Jellyfin"; rm -rf "$new" "$RUN"; return 0; }
+    fi
+    while read -r file; do
+        [ -n "$file" ] || continue
+        if [ ! -f "$new/bin/$file" ] || [ ! -f "$build/server/$file" ]; then
+            log "$file missing in Jellyfin $version or in the build; starting stock Jellyfin"
+            rm -rf "$new" "$RUN"; return 0
+        fi
+        if ! { rm -f "$new/bin/$file" && cp "$build/server/$file" "$new/bin/$file"; }; then
+            log "could not install $file; starting stock Jellyfin"
+            rm -rf "$new" "$RUN"; return 0
+        fi
+    done < <(manifest_get "$build/manifest.json" server)
+
+    if [ "$(manifest_get "$build/manifest.json" web)" = "true" ] && [ "$web_version" = "$version" ] && [ -f "$build/web/index.html" ]; then
+        ln -s "$build/web" "$new/web"
+    else
+        ln -s "$STOCK_WEB" "$new/web"
+    fi
+    echo "$version" > "$new/VERSION"
+
+    [ -d "$RUN" ] && mv "$RUN" "$STATE/run.old"
+    mv "$new" "$RUN"
+    rm -rf "$STATE/run.old"
+    log "starting Jellyfin $version with the patch ($(manifest_get "$build/manifest.json" source))"
+}
+
+run() {
+    local args=() arg skip=0
+    # Only a run tree prepared for the installed version is used (prepare may have been skipped).
+    if [ -x "$RUN/bin/jellyfin" ] && [ -f "$RUN/web/index.html" ] && [ "$(cat "$RUN/VERSION" 2>/dev/null)" = "$(installed jellyfin-server)" ]; then
+        for arg in "$@"; do
+            if [ $skip = 1 ]; then skip=0; continue; fi
+            case $arg in
+                --webdir=*) arg=--webdir=$RUN/web ;;
+                --webdir|-w) args+=("--webdir=$RUN/web"); skip=1; continue ;;
+            esac
+            args+=("$arg")
+        done
+        exec "$RUN/bin/jellyfin" "${args[@]}"
+    fi
+    exec "$STOCK_EXE" "$@"
+}
+
+status() {
+    local version pid exe
+    version=$(installed jellyfin-server)
+    echo "installed:  jellyfin-server $version, jellyfin-web $(installed jellyfin-web)"
+    echo "patch:      $([ -e "$DISABLED" ] && echo disabled || echo enabled)"
+    echo "builds:     $(ls -1 "$BUILDS" 2>/dev/null | grep -E '^[0-9.]+$' | sort -V | tr '\n' ' ')"
+    [ -f "$BUILDS/$version/manifest.json" ] && echo "build $version: $(manifest_get "$BUILDS/$version/manifest.json" source), $(manifest_get "$BUILDS/$version/manifest.json" built)"
+    pid=$(systemctl show -p MainPID --value jellyfin)
+    exe=$(readlink "/proc/$pid/exe" 2>/dev/null)
+    case $exe in
+        "$RUN"/*) echo "running:    patched Jellyfin $(cat "$RUN/VERSION" 2>/dev/null) (pid $pid)" ;;
+        "") echo "running:    no" ;;
+        *) echo "running:    stock Jellyfin (pid $pid)" ;;
+    esac
+}
+
+action=${1:-}
+[ $# -gt 0 ] && shift
+case $action in
+    run) run "$@" ;;
+    prepare) prepare; exit 0 ;;
+    fetch) fetch "${1:-$(installed jellyfin-server)}" ;;
+    add)
+        [ -f "${1:-}" ] && [ -f "$1.sha256" ] || { echo "usage: jellyfin-patch add FILE.tar.gz (with FILE.tar.gz.sha256)"; exit 2; }
+        mkdir -p "$BUILDS"
+        version=$( (tar -xzOf "$1" manifest.json 2>/dev/null || tar -xzOf "$1" ./manifest.json) | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["version"])') && valid_version "$version" && add_build "$1" "$version" ;;
+    disable) mkdir -p "$STATE" && touch "$DISABLED" && echo "Disabled; restart Jellyfin to run it stock." ;;
+    enable) rm -f "$DISABLED" && echo "Enabled; restart Jellyfin to use the patch." ;;
+    status) status ;;
+    *) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

@@ -1,0 +1,81 @@
+name: Build patched Jellyfin
+
+# Every hour: if the newest Jellyfin release has no build here yet (or the patches
+# changed since its build), build it and publish it as release v<version> with
+# jellyfin-patch-<version>.tar.gz and .sha256. A failed run (e.g. a patch that no
+# longer applies) is emailed to the repository owner by GitHub.
+on:
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Jellyfin version, e.g. 12.4 (empty = newest release)
+        required: false
+      rebuild:
+        description: Build even if this version was already built from these patches
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths: ['patches/**', 'scripts/build.sh', 'scripts/merge-strings.mjs']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pick the version
+        id: pick
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          REBUILD: ${{ inputs.rebuild }}
+        run: |
+          version=${INPUT_VERSION:-$(gh release view --repo jellyfin/jellyfin --json tagName --jq .tagName)}
+          version=${version#v}
+          fingerprint=$(cat patches/jellyfin/*.patch patches/jellyfin-web/*.patch patches/jellyfin-web/strings/*.json scripts/build.sh scripts/merge-strings.mjs | sha256sum | cut -c1-16)
+          built=$(gh release view "v$version" --json body --jq .body 2>/dev/null | sed -n 's/.*patches \([0-9a-f]\{16\}\).*/\1/p' || true)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
+          if [ "$built" = "$fingerprint" ] && [ "$REBUILD" != true ]; then
+            echo "Jellyfin $version is already built from these patches."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-dotnet@v4
+        if: steps.pick.outputs.skip != 'true'
+        with:
+          dotnet-version: '10.0.x'
+
+      - uses: actions/setup-node@v4
+        if: steps.pick.outputs.skip != 'true'
+        with:
+          node-version: '24'
+
+      - name: Build
+        if: steps.pick.outputs.skip != 'true'
+        run: bash scripts/build.sh "${{ steps.pick.outputs.version }}" out
+
+      - name: Publish
+        if: steps.pick.outputs.skip != 'true'
+        env:
+          VERSION: ${{ steps.pick.outputs.version }}
+          FINGERPRINT: ${{ steps.pick.outputs.fingerprint }}
+        run: |
+          notes="Jellyfin $VERSION with the patches in this repository (patches $FINGERPRINT, commit ${GITHUB_SHA::7})."
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            gh release upload "v$VERSION" out/* --clobber
+            gh release edit "v$VERSION" --notes "$notes"
+          else
+            gh release create "v$VERSION" out/* --title "Jellyfin $VERSION (patched)" --notes "$notes"
+          fi

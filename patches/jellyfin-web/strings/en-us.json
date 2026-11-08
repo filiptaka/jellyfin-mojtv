@@ -1,0 +1,6 @@
+{
+    "LabelDisplayLatestEpisodes": "Display episodes in Recently Added",
+    "LabelDisplayLatestEpisodesHelp": "When only one episode of a show was added within 24 hours, show that episode instead of the season or show.",
+    "LabelDisplayLatestSeasons": "Display seasons in Recently Added",
+    "LabelDisplayLatestSeasonsHelp": "When the new episodes all belong to one season, show that season instead of the whole show."
+}

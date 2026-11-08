@@ -1,0 +1,8 @@
+{
+    "LabelDisplayLatestEpisodes": "Prikaži epizode u Nedavno dodano",
+    "LabelDisplayLatestEpisodesHelp": "Kada je unutar 24 sata dodana samo jedna epizoda serije, prikaži tu epizodu umjesto sezone ili serije.",
+    "LabelDisplayLatestSeasons": "Prikaži sezone u Nedavno dodano",
+    "LabelDisplayLatestSeasonsHelp": "Kada sve nove epizode pripadaju jednoj sezoni, prikaži tu sezonu umjesto cijele serije.",
+    "LabelGroupShowsIntoCollections": "Grupiraj serije u zbirke",
+    "LabelGroupShowsIntoCollectionsHelp": "Kada se prikazuje lista serija, serije koje pripadaju zbirci će se prikazati kao jedna grupirana stavka."
+}

@@ -1,0 +1,271 @@
+From b419201e7bdb7de647f11f8a3911de338585f8ba Mon Sep 17 00:00:00 2001
+From: theguymadmax <theguymadmax@proton.me>
+Date: Sat, 10 Oct 2026 03:21:42 -0400
+Subject: [PATCH 1/2] Add season and episode options for recently added
+
+---
+ Emby.Server.Implementations/Dto/DtoService.cs |  8 +++++--
+ .../Library/UserViewManager.cs                |  4 +++-
+ .../Item/BaseItemRepository.Querying.cs       | 23 +++++++++++++++----
+ .../Entities/InternalItemsQuery.cs            |  4 ++++
+ .../Configuration/ServerConfiguration.cs      |  4 ++++
+ .../Dto/DtoServiceImageInheritanceTests.cs    |  5 +++-
+ .../Dto/DtoServiceTests.cs                    | 10 +++++++-
+ 7 files changed, 49 insertions(+), 9 deletions(-)
+
+diff --git a/Emby.Server.Implementations/Dto/DtoService.cs b/Emby.Server.Implementations/Dto/DtoService.cs
+index e539508..11c711d 100644
+--- a/Emby.Server.Implementations/Dto/DtoService.cs
++++ b/Emby.Server.Implementations/Dto/DtoService.cs
+@@ -13,6 +13,7 @@ using Jellyfin.Extensions;
+ using MediaBrowser.Common;
+ using MediaBrowser.Controller.Channels;
+ using MediaBrowser.Controller.Chapters;
++using MediaBrowser.Controller.Configuration;
+ using MediaBrowser.Controller.Drawing;
+ using MediaBrowser.Controller.Dto;
+ using MediaBrowser.Controller.Entities;
+@@ -126,6 +127,7 @@ namespace Emby.Server.Implementations.Dto
+ 
+         private readonly ITrickplayManager _trickplayManager;
+         private readonly IChapterManager _chapterManager;
++        private readonly IServerConfigurationManager _config;
+ 
+         public DtoService(
+             ILogger<DtoService> logger,
+@@ -138,7 +140,8 @@ namespace Emby.Server.Implementations.Dto
+             IMediaSourceManager mediaSourceManager,
+             Lazy<ILiveTvManager> livetvManagerFactory,
+             ITrickplayManager trickplayManager,
+-            IChapterManager chapterManager)
++            IChapterManager chapterManager,
++            IServerConfigurationManager config)
+         {
+             _logger = logger;
+             _libraryManager = libraryManager;
+@@ -151,6 +154,7 @@ namespace Emby.Server.Implementations.Dto
+             _livetvManagerFactory = livetvManagerFactory;
+             _trickplayManager = trickplayManager;
+             _chapterManager = chapterManager;
++            _config = config;
+         }
+ 
+         private ILiveTvManager LivetvManager => _livetvManagerFactory.Value;
+@@ -1551,7 +1555,7 @@ namespace Emby.Server.Implementations.Dto
+                 if (options.GetImageLimit(ImageType.Primary) > 0)
+                 {
+                     var episodeSeason = episode.Season;
+-                    var seasonPrimaryTag = episodeSeason is not null
++                    var seasonPrimaryTag = episodeSeason is not null && _config.Configuration.DisplayLatestSeasons
+                         ? GetTagAndFillBlurhash(dto, episodeSeason, ImageType.Primary)
+                         : null;
+ 
+diff --git a/Emby.Server.Implementations/Library/UserViewManager.cs b/Emby.Server.Implementations/Library/UserViewManager.cs
+index 6d52ce7..e1e8b2f 100644
+--- a/Emby.Server.Implementations/Library/UserViewManager.cs
++++ b/Emby.Server.Implementations/Library/UserViewManager.cs
+@@ -390,7 +390,9 @@ namespace Emby.Server.Implementations.Library
+                 Limit = limit * 2,
+                 IsPlayed = isPlayed,
+                 DtoOptions = options,
+-                MediaTypes = mediaTypes
++                MediaTypes = mediaTypes,
++                DisplayLatestSeasons = _config.Configuration.DisplayLatestSeasons,
++                DisplayLatestEpisodes = _config.Configuration.DisplayLatestEpisodes
+             };
+ 
+             if (request.GroupItems)
+diff --git a/Jellyfin.Server.Implementations/Item/BaseItemRepository.Querying.cs b/Jellyfin.Server.Implementations/Item/BaseItemRepository.Querying.cs
+index 8d57356..3721f23 100644
+--- a/Jellyfin.Server.Implementations/Item/BaseItemRepository.Querying.cs
++++ b/Jellyfin.Server.Implementations/Item/BaseItemRepository.Querying.cs
+@@ -273,6 +273,11 @@ public sealed partial class BaseItemRepository
+     ///     <item>Otherwise → return the most recent Episode</item>
+     /// </list>
+     /// </para>
++    /// <para>
++    /// The behavior is affected by <see cref="InternalItemsQuery.DisplayLatestSeasons"/> (Season cards, off by default)
++    /// and <see cref="InternalItemsQuery.DisplayLatestEpisodes"/> (24h grouping, off by default).
++    /// When DisplayLatestEpisodes is off, every episode counts as recent and a Series card is always returned.
++    /// </para>
+     /// </remarks>
+     /// <param name="context">The database context.</param>
+     /// <param name="baseQuery">The base query with filters already applied.</param>
+@@ -284,6 +289,8 @@ public sealed partial class BaseItemRepository
+         // Episodes added within this window are considered "recently added together"
+         const double RecentAdditionWindowHours = 24.0;
+ 
++        var displayEpisodes = filter.DisplayLatestEpisodes;
++
+         // Step 1: Find the top N series with recently added content, ordered by most recent addition
+         var topSeriesWithDates = baseQuery
+             .Where(e => e.SeriesName != null)
+@@ -306,7 +313,7 @@ public sealed partial class BaseItemRepository
+         // Compute a global date cutoff: the oldest series' max date minus the window.
+         // Episodes before this cutoff cannot be in any series' "recent additions" window,
+         // so we can safely exclude them to avoid loading ancient episodes.
+-        var globalCutoff = topSeriesData.Count > 0
++        var globalCutoff = displayEpisodes && topSeriesData.Count > 0
+             ? topSeriesData.Min(g => g.MaxDate)?.AddHours(-RecentAdditionWindowHours)
+             : null;
+ 
+@@ -341,7 +348,9 @@ public sealed partial class BaseItemRepository
+         {
+             var episodes = group.ToList();
+             var mostRecentDate = episodes[0].DateCreated ?? DateTime.MinValue;
+-            var recentCutoff = mostRecentDate.AddHours(-RecentAdditionWindowHours);
++            var recentCutoff = displayEpisodes
++                ? mostRecentDate.AddHours(-RecentAdditionWindowHours)
++                : DateTime.MinValue;
+ 
+             // Find episodes added within the recent window
+             var recentEpisodeCount = 0;
+@@ -390,7 +399,7 @@ public sealed partial class BaseItemRepository
+                 .ToDictionary(x => x.SeasonId, x => x.Count)
+             : [];
+ 
+-        var seriesSeasonCounts = allSeriesIds.Count > 0
++        var seriesSeasonCounts = filter.DisplayLatestSeasons && allSeriesIds.Count > 0
+             ? context.BaseItems
+                 .AsNoTracking()
+                 .Where(e => e.SeriesId.HasValue && allSeriesIds.Contains(e.SeriesId.Value) && e.Type == seasonType)
+@@ -423,7 +432,7 @@ public sealed partial class BaseItemRepository
+                     : 1;
+ 
+                 // Check if multiple episodes were added, or if all episodes in the season were added
+-                var hasMultipleOrAllEpisodes = recentEpisodeCount > 1 || recentEpisodeCount == totalEpisodes;
++                var hasMultipleOrAllEpisodes = !displayEpisodes || recentEpisodeCount > 1 || recentEpisodeCount == totalEpisodes;
+ 
+                 if (totalSeasonsInSeries > 1 && hasMultipleOrAllEpisodes)
+                 {
+@@ -446,6 +455,12 @@ public sealed partial class BaseItemRepository
+                 seriesId = firstRecentSeriesId;
+                 entitiesToFetch.Add(seriesId!.Value);
+             }
++            else if (!displayEpisodes && firstRecentSeriesId.HasValue)
++            {
++                // Episodes with no season id would fall through to an Episode, so show the Series instead
++                seriesId = firstRecentSeriesId;
++                entitiesToFetch.Add(firstRecentSeriesId.Value);
++            }
+ 
+             if (seasonId is null && seriesId is null)
+             {
+diff --git a/MediaBrowser.Controller/Entities/InternalItemsQuery.cs b/MediaBrowser.Controller/Entities/InternalItemsQuery.cs
+index e0f0e0d..6739bcc 100644
+--- a/MediaBrowser.Controller/Entities/InternalItemsQuery.cs
++++ b/MediaBrowser.Controller/Entities/InternalItemsQuery.cs
+@@ -512,6 +512,10 @@ namespace MediaBrowser.Controller.Entities
+ 
+         public bool IncludeExtras { get; set; }
+ 
++        public bool DisplayLatestSeasons { get; set; }
++
++        public bool DisplayLatestEpisodes { get; set; }
++
+         public IReadOnlyList<string> AudioLanguages { get; set; }
+ 
+         public IReadOnlyList<string> SubtitleLanguages { get; set; }
+diff --git a/MediaBrowser.Model/Configuration/ServerConfiguration.cs b/MediaBrowser.Model/Configuration/ServerConfiguration.cs
+index ac5c123..2388e09 100644
+--- a/MediaBrowser.Model/Configuration/ServerConfiguration.cs
++++ b/MediaBrowser.Model/Configuration/ServerConfiguration.cs
+@@ -210,6 +210,10 @@ public class ServerConfiguration : BaseApplicationConfiguration
+ 
+     public bool DisplaySpecialsWithinSeasons { get; set; } = true;
+ 
++    public bool DisplayLatestSeasons { get; set; } = false;
++
++    public bool DisplayLatestEpisodes { get; set; } = false;
++
+     public string[] CodecsUsed { get; set; } = Array.Empty<string>();
+ 
+     public RepositoryInfo[] PluginRepositories { get; set; } = Array.Empty<RepositoryInfo>();
+diff --git a/tests/Jellyfin.Server.Implementations.Tests/Dto/DtoServiceImageInheritanceTests.cs b/tests/Jellyfin.Server.Implementations.Tests/Dto/DtoServiceImageInheritanceTests.cs
+index 6a3dcab..3903dd9 100644
+--- a/tests/Jellyfin.Server.Implementations.Tests/Dto/DtoServiceImageInheritanceTests.cs
++++ b/tests/Jellyfin.Server.Implementations.Tests/Dto/DtoServiceImageInheritanceTests.cs
+@@ -5,6 +5,7 @@ using Emby.Server.Implementations.Playlists;
+ using Jellyfin.Data.Enums;
+ using MediaBrowser.Common;
+ using MediaBrowser.Controller.Chapters;
++using MediaBrowser.Controller.Configuration;
+ using MediaBrowser.Controller.Drawing;
+ using MediaBrowser.Controller.Dto;
+ using MediaBrowser.Controller.Entities;
+@@ -304,6 +305,7 @@ public class DtoServiceImageInheritanceTests
+         var liveTvManager = new Mock<ILiveTvManager>();
+         var trickplayManager = new Mock<ITrickplayManager>();
+         var chapterManager = new Mock<IChapterManager>();
++        var config = new Mock<IServerConfigurationManager>();
+         var logger = new Mock<Microsoft.Extensions.Logging.ILogger<DtoService>>();
+ 
+         imageProcessor
+@@ -325,6 +327,7 @@ public class DtoServiceImageInheritanceTests
+             mediaSourceManager.Object,
+             new Lazy<ILiveTvManager>(() => liveTvManager.Object),
+             trickplayManager.Object,
+-            chapterManager.Object);
++            chapterManager.Object,
++            config.Object);
+     }
+ }
+diff --git a/tests/Jellyfin.Server.Implementations.Tests/Dto/DtoServiceTests.cs b/tests/Jellyfin.Server.Implementations.Tests/Dto/DtoServiceTests.cs
+index fd84cfb..d104b90 100644
+--- a/tests/Jellyfin.Server.Implementations.Tests/Dto/DtoServiceTests.cs
++++ b/tests/Jellyfin.Server.Implementations.Tests/Dto/DtoServiceTests.cs
+@@ -8,6 +8,7 @@ using Jellyfin.Database.Implementations.Entities;
+ using Jellyfin.Database.Implementations.Enums;
+ using MediaBrowser.Common;
+ using MediaBrowser.Controller.Chapters;
++using MediaBrowser.Controller.Configuration;
+ using MediaBrowser.Controller.Drawing;
+ using MediaBrowser.Controller.Dto;
+ using MediaBrowser.Controller.Entities;
+@@ -16,6 +17,7 @@ using MediaBrowser.Controller.Library;
+ using MediaBrowser.Controller.LiveTv;
+ using MediaBrowser.Controller.Providers;
+ using MediaBrowser.Controller.Trickplay;
++using MediaBrowser.Model.Configuration;
+ using MediaBrowser.Model.Entities;
+ using MediaBrowser.Model.Querying;
+ using Microsoft.Extensions.Logging.Abstractions;
+@@ -28,6 +30,7 @@ public class DtoServiceTests
+ {
+     private readonly Mock<ILibraryManager> _libraryManagerMock;
+     private readonly Mock<IUserDataManager> _userDataManagerMock;
++    private readonly ServerConfiguration _serverConfig = new();
+     private readonly DtoService _dtoService;
+ 
+     public DtoServiceTests()
+@@ -47,6 +50,9 @@ public class DtoServiceTests
+         // Video.SourceType probes the active-recording manager; provide one so it doesn't NRE.
+         Video.RecordingsManager = new Mock<IRecordingsManager>().Object;
+ 
++        var configMock = new Mock<IServerConfigurationManager>();
++        configMock.Setup(x => x.Configuration).Returns(_serverConfig);
++
+         _dtoService = new DtoService(
+             NullLogger<DtoService>.Instance,
+             _libraryManagerMock.Object,
+@@ -58,7 +64,8 @@ public class DtoServiceTests
+             new Mock<IMediaSourceManager>().Object,
+             new Lazy<ILiveTvManager>(() => new Mock<ILiveTvManager>().Object),
+             new Mock<ITrickplayManager>().Object,
+-            new Mock<IChapterManager>().Object);
++            new Mock<IChapterManager>().Object,
++            configMock.Object);
+ 
+         // Episode.Series / Episode.Season resolve through the static BaseItem.LibraryManager.
+         BaseItem.LibraryManager = _libraryManagerMock.Object;
+@@ -67,6 +74,7 @@ public class DtoServiceTests
+     [Fact]
+     public void GetBaseItemDto_Episode_AttachesSeasonPosterAsParentPrimaryImage()
+     {
++        _serverConfig.DisplayLatestSeasons = true;
+         var (episode, season, _) = BuildEpisode(seasonHasPoster: true);
+         var options = new DtoOptions(false) { Fields = [ItemFields.PrimaryImageAspectRatio] };
+ 
+-- 
+2.38.1.windows.1
+
