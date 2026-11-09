@@ -89,6 +89,24 @@ check "disabled: stock" '[ ! -e "$run_tree" ]'
 "$script" enable > /dev/null && "$script" prepare > /dev/null
 check "enabled again: patched" '[ "$(cat "$run_tree/VERSION")" = "$version" ]'
 
+echo "== patched build crashes right after starting"
+crash() { SERVICE_RESULT=exit-code EXIT_STATUS=134 "$script" stopped > /dev/null; "$script" prepare > /dev/null; }
+crash
+check "one crash: still patched" '[ -d "$run_tree" ]'
+crash
+check "two crashes: stock" '[ ! -e "$run_tree" ]'
+check "status explains it" '[[ $("$script" status) == *"crashed 2 time"* ]]'
+crash
+check "a stock run is not counted" '[ "$(cut -d" " -f2 "$t/state-dir/crashed")" = 2 ]'
+"$script" enable > /dev/null; "$script" prepare > /dev/null
+check "enable: patched again" '[ -d "$run_tree" ]'
+crash
+SERVICE_RESULT=success "$script" stopped > /dev/null; "$script" prepare > /dev/null
+check "a clean stop clears the count" '[ ! -e "$t/state-dir/crashed" ] && [ -d "$run_tree" ]'
+echo "0000 5" > "$t/state-dir/crashed"; "$script" prepare > /dev/null
+check "crashes of another build don't count" '[ -d "$run_tree" ]'
+SERVICE_RESULT=success "$script" stopped > /dev/null
+
 echo "== corrupted download"
 "$script" disable > /dev/null; "$script" prepare > /dev/null
 rm -rf "$t/state-dir/builds"

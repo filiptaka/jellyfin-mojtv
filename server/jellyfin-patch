@@ -9,6 +9,8 @@
 #
 # A patched build is used only for the exact version installed by apt. When there
 # is none (not built yet, download failed, patch disabled), Jellyfin starts stock.
+# A build that crashes twice within 5 minutes of starting is not used again until
+# another build arrives or `enable` is run.
 # Builds come from the GitHub releases of $REPO: v<version>/jellyfin-patch-<version>.tar.gz
 #
 #   jellyfin-patch status            what is installed, cached and running
@@ -17,6 +19,7 @@
 #   jellyfin-patch disable | enable  stop or resume using the patch (takes effect at the next restart)
 #   jellyfin-patch prepare           (ExecStartPre, as root)
 #   jellyfin-patch run ARGS...       (ExecStart, as the jellyfin user)
+#   jellyfin-patch stopped           (ExecStopPost, as root)
 set -uo pipefail
 
 REPO=filiptaka/jellyfin-mojtv
@@ -31,7 +34,11 @@ LOG=${JELLYFIN_PATCH_LOG:-/var/log/jellyfin-patch.log}
 BUILDS=$STATE/builds
 RUN=$STATE/run
 DISABLED=$STATE/disabled
+STARTED=$STATE/started   # "<start time> <build checksum>" while a patched Jellyfin runs
+CRASHED=$STATE/crashed   # "<build checksum> <count>": crashes of that build soon after starting
 KEEP_BUILDS=3
+CRASH_WINDOW=300
+MAX_CRASHES=2
 
 log() {
     echo "jellyfin-patch: $*"
@@ -44,7 +51,14 @@ installed() { dpkg-query -W -f='${Version}' "$1" 2>/dev/null | cut -d+ -f1; }
 
 valid_version() { [[ $1 =~ ^[0-9]{1,3}(\.[0-9]{1,4}){1,3}$ ]]; }
 
-manifest_get() { python3 -I -c 'import json,sys; m=json.load(open(sys.argv[1])); v=m.get(sys.argv[2]); print("\n".join(v) if isinstance(v, list) else ("" if v is None else str(v).lower()))' "$1" "$2" | tr -d '\r'; }
+manifest_get() { python3 -I -c 'import json,sys; m=json.load(open(sys.argv[1])); v=m.get(sys.argv[2]); print("\n".join(v) if isinstance(v, list) else ("" if v is None else (str(v).lower() if isinstance(v, bool) else str(v))))' "$1" "$2" | tr -d '\r'; }
+
+# How often the build with this checksum crashed right after starting.
+crashes_of() {
+    local sum count
+    { read -r sum count < "$CRASHED"; } 2>/dev/null || { echo 0; return; }
+    if [ -n "$1" ] && [ "$sum" = "$1" ] && [[ $count =~ ^[0-9]+$ ]]; then echo "$count"; else echo 0; fi
+}
 
 # Unpack a downloaded tarball (with its .sha256) into $BUILDS/<version>.
 add_build() {
@@ -106,7 +120,7 @@ refresh() {
 }
 
 prepare() {
-    local version web_version build new file
+    local version web_version build new file sum
     version=$(installed jellyfin-server)
     web_version=$(installed jellyfin-web)
     build=$BUILDS/$version
@@ -117,6 +131,7 @@ prepare() {
         return 0
     fi
     rm -rf "$STATE/run.new" "$STATE/run.old"
+    rm -f "$STARTED"
 
     if [ -e "$DISABLED" ] || ! valid_version "$version"; then
         log "patch disabled or jellyfin-server not installed; starting stock Jellyfin"
@@ -127,6 +142,12 @@ prepare() {
         log "starting stock Jellyfin $version"
         rm -rf "$RUN"; return 0
     }
+
+    sum=$(cat "$build/.sha256" 2>/dev/null)
+    if [ "$(crashes_of "$sum")" -ge $MAX_CRASHES ]; then
+        log "build $version crashed $MAX_CRASHES times right after starting; starting stock Jellyfin (jellyfin-patch enable tries it again)"
+        rm -rf "$RUN"; return 0
+    fi
 
     new=$STATE/run.new
     mkdir -p "$new"
@@ -157,6 +178,7 @@ prepare() {
     [ -d "$RUN" ] && mv "$RUN" "$STATE/run.old"
     mv "$new" "$RUN"
     rm -rf "$STATE/run.old"
+    echo "$(date +%s) $sum" > "$STARTED"
     log "starting Jellyfin $version with the patch ($(manifest_get "$build/manifest.json" source))"
 }
 
@@ -177,13 +199,35 @@ run() {
     exec "$STOCK_EXE" "$@"
 }
 
+# After Jellyfin stopped (systemd sets SERVICE_RESULT): count a crash of the patched build
+# within $CRASH_WINDOW seconds of its start; a clean stop clears the count.
+stopped() {
+    local at sum now
+    { read -r at sum < "$STARTED"; } 2>/dev/null || return 0
+    rm -f "$STARTED"
+    [[ $at =~ ^[0-9]+$ ]] || return 0
+    now=$(date +%s)
+    case ${SERVICE_RESULT:-} in
+        exit-code|signal|core-dump)
+            if [ $((now - at)) -lt $CRASH_WINDOW ]; then
+                echo "$sum $(( $(crashes_of "$sum") + 1 ))" > "$CRASHED"
+                log "patched Jellyfin crashed ($SERVICE_RESULT ${EXIT_STATUS:-}) $((now - at))s after starting"
+            fi ;;
+        *) rm -f "$CRASHED" ;;
+    esac
+}
+
 status() {
-    local version pid exe
+    local version pid exe crashes
     version=$(installed jellyfin-server)
     echo "installed:  jellyfin-server $version, jellyfin-web $(installed jellyfin-web)"
     echo "patch:      $([ -e "$DISABLED" ] && echo disabled || echo enabled)"
     echo "builds:     $(ls -1 "$BUILDS" 2>/dev/null | grep -E '^[0-9.]+$' | sort -V | tr '\n' ' ')"
-    [ -f "$BUILDS/$version/manifest.json" ] && echo "build $version: $(manifest_get "$BUILDS/$version/manifest.json" source), $(manifest_get "$BUILDS/$version/manifest.json" built)"
+    [ -f "$BUILDS/$version/manifest.json" ] && echo "build $version: $(manifest_get "$BUILDS/$version/manifest.json" source), built $(manifest_get "$BUILDS/$version/manifest.json" built)"
+    crashes=$(crashes_of "$(cat "$BUILDS/$version/.sha256" 2>/dev/null)")
+    if [ "$crashes" -gt 0 ]; then
+        echo "crashes:    build $version crashed $crashes time(s) right after starting$([ "$crashes" -ge $MAX_CRASHES ] && echo ', so Jellyfin starts stock (jellyfin-patch enable tries it again)')"
+    fi
     pid=$(systemctl show -p MainPID --value jellyfin)
     exe=$(readlink "/proc/$pid/exe" 2>/dev/null)
     case $exe in
@@ -198,13 +242,14 @@ action=${1:-}
 case $action in
     run) run "$@" ;;
     prepare) prepare; exit 0 ;;
+    stopped) stopped; exit 0 ;;
     fetch) fetch "${1:-$(installed jellyfin-server)}" ;;
     add)
         [ -f "${1:-}" ] && [ -f "$1.sha256" ] || { echo "usage: jellyfin-patch add FILE.tar.gz (with FILE.tar.gz.sha256)"; exit 2; }
         mkdir -p "$BUILDS"
         version=$( (tar -xzOf "$1" manifest.json 2>/dev/null || tar -xzOf "$1" ./manifest.json) | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["version"])') && valid_version "$version" && add_build "$1" "$version" ;;
     disable) mkdir -p "$STATE" && touch "$DISABLED" && echo "Disabled; restart Jellyfin to run it stock." ;;
-    enable) rm -f "$DISABLED" && echo "Enabled; restart Jellyfin to use the patch." ;;
+    enable) rm -f "$DISABLED" "$CRASHED" && echo "Enabled; restart Jellyfin to use the patch." ;;
     status) status ;;
-    *) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+    *) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit 2 ;;
 esac
