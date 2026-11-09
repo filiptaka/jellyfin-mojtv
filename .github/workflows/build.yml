@@ -22,6 +22,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: build
@@ -33,6 +34,11 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
+      # GitHub stops the scheduled runs of a public repository after 60 days without commits.
+      # Enabling the workflow again through the API prevents that (as liskin/gh-workflow-keepalive does).
+      - name: Keep the hourly schedule enabled
+        run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/build.yml/enable"
+
       - uses: actions/checkout@v4
 
       - name: Pick the version
